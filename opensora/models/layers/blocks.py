@@ -28,7 +28,6 @@ from opensora.acceleration.parallel_states import get_sequence_parallel_group
 
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
-
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -129,6 +128,78 @@ class PatchEmbed3D(nn.Module):
         return x
 
 
+n_attention = 0
+
+@torch.library.custom_op('opensora::flashattention', mutates_args=())
+def _flash_attention_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, causal: bool) -> torch.Tensor:
+    global n_attention
+    n_attention += 1
+    # print('n_attention', n_attention)
+    from flash_attn import flash_attn_func
+    return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal)
+
+@torch.library.register_fake('opensora::flashattention')
+def _flash_attention_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, causal: bool) -> torch.Tensor:
+    B, N, H, D = q.shape
+    O = torch.zeros((B, N, H, D), device=q.device, dtype=q.dtype)
+    return O
+
+def _flash_attention_backward(ctx, grad_output) -> tuple:
+    q, k, v = ctx.saved_tensors
+    grad_q = torch.zeros_like(q)
+    grad_k = torch.zeros_like(k)
+    grad_v = torch.zeros_like(v)
+    return grad_q, grad_k, grad_v, None, None, None
+
+def _flash_attention_backward_setup_context(ctx, inputs, output):
+    q, k, v, dropout_p, softmax_scale, causal = inputs
+    ctx.save_for_backward(q, k, v)
+
+_flash_attention_wrapper.register_autograd(_flash_attention_backward, setup_context=_flash_attention_backward_setup_context)
+
+xformers_attn_cache = {}
+
+# global_mask = torch.tensor([11, 11], dtype=torch.int32, device='cuda')
+
+@torch.library.custom_op('opensora::xformers_mha', mutates_args=())
+def _xformers_mha_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, mask: bool, N: int, B: int) -> torch.Tensor:
+    attn_bias = None
+    if mask:
+        # mask = mask.tolist()
+        q_seqlen = [N] * B
+        kv_seqlen = [11, 11]
+        hash_key = tuple(q_seqlen)
+        if hash_key in xformers_attn_cache:
+            # print('USING CACHED ATTN BIAS')
+            attn_bias = xformers_attn_cache[hash_key]
+        else:
+            # print('CREATING NEW ATTN BIAS')
+            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
+            xformers_attn_cache[hash_key] = attn_bias
+    # print('q shape', q.shape)
+    # print('k shape', k.shape)
+    # print('v shape', v.shape)
+    return xformers.ops.memory_efficient_attention(q, k, v, p=dropout_p, attn_bias=attn_bias)
+
+@torch.library.register_fake('opensora::xformers_mha')
+def _xformers_mha_fake(q, k, v, dropout_p, mask, N, B):
+    B, N, H, D = q.shape
+    O = torch.zeros((B, N, H, D), device=q.device, dtype=q.dtype)
+    return O
+
+def _xformers_mha_backward(ctx, grad_output) -> tuple:
+    q, k, v = ctx.saved_tensors
+    grad_q = torch.zeros_like(q)
+    grad_k = torch.zeros_like(k)
+    grad_v = torch.zeros_like(v)
+    return grad_q, grad_k, grad_v, None, None, None, None
+
+def _xformers_mha_backward_setup_context(ctx, inputs, output):
+    q, k, v, dropout_p, mask, N, B = inputs
+    ctx.save_for_backward(q, k, v)
+
+_xformers_mha_wrapper.register_autograd(_xformers_mha_backward, setup_context=_xformers_mha_backward_setup_context)
+
 class Attention(nn.Module):
     def __init__(
         self,
@@ -188,20 +259,10 @@ class Attention(nn.Module):
                 k = self.rotary_emb(k)
 
         if enable_flash_attn:
-            from flash_attn import flash_attn_func
-
-            # (B, #heads, N, #dim) -> (B, N, #heads, #dim)
             q = q.permute(0, 2, 1, 3)
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
-            x = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=self.is_causal,
-            )
+            x = _flash_attention_wrapper(q, k, v, self.attn_drop.p if self.training else 0.0, self.scale, self.is_causal)
         else:
             dtype = q.dtype
             q = q * self.scale
@@ -471,10 +532,10 @@ class MultiHeadCrossAttention(nn.Module):
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
 
-        attn_bias = None
-        if mask is not None:
-            attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        # xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        # if mask is not None:
+        #     mask = torch.tensor(mask, dtype=torch.int, device='cpu')
+        x = _xformers_mha_wrapper(q, k, v, self.attn_drop.p, mask is not None, N, B)
 
         x = x.view(B, -1, C)
         x = self.proj(x)

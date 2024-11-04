@@ -1,6 +1,8 @@
 import os
 
 import numpy as np
+from codetiming import Timer
+import time
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -10,7 +12,8 @@ from rotary_embedding_torch import RotaryEmbedding
 from timm.models.layers import DropPath
 from timm.models.vision_transformer import Mlp
 from transformers import PretrainedConfig, PreTrainedModel
-
+import wat
+from opensora.sg_profiler import sg_profiler
 from opensora.acceleration.checkpoint import auto_grad_checkpoint
 from opensora.acceleration.communications import gather_forward_split_backward, split_forward_gather_backward
 from opensora.acceleration.parallel_states import get_sequence_parallel_group
@@ -31,7 +34,8 @@ from opensora.models.layers.blocks import (
 )
 from opensora.registry import MODELS
 from opensora.utils.ckpt_utils import load_checkpoint
-
+import pickle
+from opensora.soham.config import SHOULD_COMPILE, SHOULD_SAVE_PICKLE
 
 class STDiT3Block(nn.Module):
     def __init__(
@@ -60,7 +64,7 @@ class STDiT3Block(nn.Module):
             attn_cls = Attention
             mha_cls = MultiHeadCrossAttention
 
-        self.norm1 = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel)
+        self.norm1 = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=False)
         self.attn = attn_cls(
             hidden_size,
             num_heads=num_heads,
@@ -70,10 +74,8 @@ class STDiT3Block(nn.Module):
             enable_flash_attn=enable_flash_attn,
         )
         self.cross_attn = mha_cls(hidden_size, num_heads)
-        self.norm2 = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=enable_layernorm_kernel)
-        self.mlp = Mlp(
-            in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0
-        )
+        self.norm2 = get_layernorm(hidden_size, eps=1e-6, affine=False, use_kernel=False)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=int(hidden_size * mlp_ratio), act_layer=approx_gelu, drop=0)
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.scale_shift_table = nn.Parameter(torch.randn(6, hidden_size) / hidden_size**0.5)
 
@@ -87,9 +89,10 @@ class STDiT3Block(nn.Module):
         x = rearrange(x, "B T S C -> B (T S) C")
         return x
 
+    # @torch.compile(fullgraph=True, options={'triton.cudagraphs': True, 'triton.cudagraph_support_input_mutation': True}, disable=not SHOULD_COMPILE)
     def forward(
         self,
-        x,
+        x_in,
         y,
         t,
         mask=None,  # text mask
@@ -98,6 +101,7 @@ class STDiT3Block(nn.Module):
         T=None,  # number of frames
         S=None,  # number of pixel patches
     ):
+        x = x_in
         # prepare modulate parameters
         B, N, C = x.shape
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -207,6 +211,9 @@ class STDiT3Config(PretrainedConfig):
         super().__init__(**kwargs)
 
 
+def compile_func(func):
+    return torch.compile(func, disable=not SHOULD_COMPILE)
+
 class STDiT3(PreTrainedModel):
     config_class = STDiT3Config
 
@@ -231,24 +238,24 @@ class STDiT3(PreTrainedModel):
         # input size related
         self.patch_size = config.patch_size
         self.input_sq_size = config.input_sq_size
-        self.pos_embed = PositionEmbedding2D(config.hidden_size)
-        self.rope = RotaryEmbedding(dim=self.hidden_size // self.num_heads)
+        self.pos_embed = (PositionEmbedding2D(config.hidden_size))
+        self.rope = (RotaryEmbedding(dim=self.hidden_size // self.num_heads))
 
         # embedding
         self.x_embedder = PatchEmbed3D(config.patch_size, config.in_channels, config.hidden_size)
-        self.t_embedder = TimestepEmbedder(config.hidden_size)
-        self.fps_embedder = SizeEmbedder(self.hidden_size)
-        self.t_block = nn.Sequential(
+        self.t_embedder = (TimestepEmbedder(config.hidden_size))
+        self.fps_embedder = (SizeEmbedder(self.hidden_size))
+        self.t_block = (nn.Sequential(
             nn.SiLU(),
             nn.Linear(config.hidden_size, 6 * config.hidden_size, bias=True),
-        )
-        self.y_embedder = CaptionEmbedder(
+        ))
+        self.y_embedder = (CaptionEmbedder(
             in_channels=config.caption_channels,
             hidden_size=config.hidden_size,
             uncond_prob=config.class_dropout_prob,
             act_layer=approx_gelu,
             token_num=config.model_max_length,
-        )
+        ))
 
         # spatial blocks
         drop_path = [x.item() for x in torch.linspace(0, self.drop_path, config.depth)]
@@ -288,7 +295,7 @@ class STDiT3(PreTrainedModel):
                 for i in range(config.depth)
             ]
         )
-
+        
         # final layer
         self.final_layer = T2IFinalLayer(config.hidden_size, np.prod(self.patch_size), self.out_channels)
 
@@ -352,6 +359,45 @@ class STDiT3(PreTrainedModel):
             y = y.squeeze(1).view(1, -1, self.hidden_size)
         return y, y_lens
 
+    @torch.compile(fullgraph=True, options={'triton.cudagraphs': True, 'triton.cudagraph_support_input_mutation': True}, disable=not SHOULD_COMPILE)
+    def compiled_blocks(self, x_in, y, t_mlp, y_lens, x_mask, t0_mlp, T, S):
+        x = x_in
+        # === blocks ===
+        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
+            x = spatial_block(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+            x = temporal_block(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        return x
+
+    @torch.compile(disable=not SHOULD_COMPILE)
+    def compiled_step_1(self, x, pos_emb, T, S):
+        # === get x embed ===
+        x = self.x_embedder(x)  # [B, N, C]
+        x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+        x = x + pos_emb
+
+        # shard over the sequence dim if sp is enabled
+        if self.enable_sequence_parallelism:
+            x = split_forward_gather_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="down")
+            S = S // dist.get_world_size(get_sequence_parallel_group())
+        x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
+        return x
+
+    @torch.compile(disable=not SHOULD_COMPILE)
+    def compiled_step_2(self, x, T, S, t, x_mask, t0, H, W, Tx, Hx, Wx):
+        if self.enable_sequence_parallelism:
+            x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+            x = gather_forward_split_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="up")
+            S = S * dist.get_world_size(get_sequence_parallel_group())
+            x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
+
+        # === final layer ===
+        x = self.final_layer(x, t, x_mask, t0, T, S)
+        x = self.unpatchify(x, T, H, W, Tx, Hx, Wx)
+
+        # cast to float32 for better accuracy
+        x = x.to(torch.float32)
+        return x
+
     def forward(self, x, timestep, y, mask=None, x_mask=None, fps=None, height=None, width=None, **kwargs):
         dtype = self.x_embedder.proj.weight.dtype
         B = x.size(0)
@@ -405,36 +451,10 @@ class STDiT3(PreTrainedModel):
                 y_lens = y_lens.long().tolist()
         else:
             y, y_lens = self.encode_text(y, mask)
-
-        # === get x embed ===
-        x = self.x_embedder(x)  # [B, N, C]
-        x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
-        x = x + pos_emb
-
-        # shard over the sequence dim if sp is enabled
-        if self.enable_sequence_parallelism:
-            x = split_forward_gather_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="down")
-            S = S // dist.get_world_size(get_sequence_parallel_group())
-
-        x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
-
-        # === blocks ===
-        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
-            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-
-        if self.enable_sequence_parallelism:
-            x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
-            x = gather_forward_split_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="up")
-            S = S * dist.get_world_size(get_sequence_parallel_group())
-            x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
-
-        # === final layer ===
-        x = self.final_layer(x, t, x_mask, t0, T, S)
-        x = self.unpatchify(x, T, H, W, Tx, Hx, Wx)
-
-        # cast to float32 for better accuracy
-        x = x.to(torch.float32)
+            
+        x = self.compiled_step_1(x, pos_emb, T, S)
+        x = self.compiled_blocks(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        x = self.compiled_step_2(x, T, S, t, x_mask, t0, H, W, Tx, Hx, Wx)
         return x
 
     def unpatchify(self, x, N_t, N_h, N_w, R_t, R_h, R_w):

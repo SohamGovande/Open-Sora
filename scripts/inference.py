@@ -2,13 +2,15 @@ import os
 import time
 from pprint import pformat
 
+from opensora.sg_profiler import sg_profiler
 import colossalai
 import torch
 import torch.distributed as dist
 from colossalai.cluster import DistCoordinator
 from mmengine.runner import set_random_seed
 from tqdm import tqdm
-
+import time
+import wat
 from opensora.acceleration.parallel_states import set_sequence_parallel_group
 from opensora.datasets import save_sample
 from opensora.datasets.aspect import get_image_size, get_num_frames
@@ -107,7 +109,7 @@ def main():
 
     # == build scheduler ==
     scheduler = build_module(cfg.scheduler, SCHEDULERS)
-
+    
     # ======================================================
     # inference
     # ======================================================
@@ -141,7 +143,6 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
     sample_name = cfg.get("sample_name", None)
     prompt_as_path = cfg.get("prompt_as_path", False)
-
     # == Iter over all samples ==
     for i in progress_wrap(range(0, len(prompts), batch_size)):
         # == prepare batch prompts ==
@@ -249,6 +250,7 @@ def main():
 
             # == Iter over loop generation ==
             video_clips = []
+            time_start = time.time()
             for loop_i in range(loop):
                 # == get prompt for loop i ==
                 batch_prompts_loop = extract_prompts_loop(batch_prompts, loop_i)
@@ -275,7 +277,7 @@ def main():
                 )
                 samples = vae.decode(samples.to(dtype), num_frames=num_frames)
                 video_clips.append(samples)
-
+            print(f"Time taken for sampling: {time.time() - time_start:.2f} seconds")
             # == save samples ==
             if is_main_process():
                 for idx, batch_prompt in enumerate(batch_prompts):
@@ -296,7 +298,8 @@ def main():
                         time.sleep(1)  # prevent loading previous generated video
                         add_watermark(save_path)
         start_idx += len(batch_prompts)
-    logger.info("Inference finished.")
+    
+    logger.info(f"Inference finished")
     logger.info("Saved %s samples to %s", start_idx, save_dir)
 
 
