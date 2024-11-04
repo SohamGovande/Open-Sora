@@ -18,6 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.utils.checkpoint
 import xformers.ops
 from einops import rearrange
@@ -27,6 +28,11 @@ from opensora.acceleration.communications import all_to_all, split_forward_gathe
 from opensora.acceleration.parallel_states import get_sequence_parallel_group
 
 approx_gelu = lambda: nn.GELU(approximate="tanh")
+
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+torch.backends.cuda.enable_cudnn_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
@@ -130,75 +136,20 @@ class PatchEmbed3D(nn.Module):
 
 n_attention = 0
 
-@torch.library.custom_op('opensora::flashattention', mutates_args=())
-def _flash_attention_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, causal: bool) -> torch.Tensor:
-    global n_attention
-    n_attention += 1
-    # print('n_attention', n_attention)
-    from flash_attn import flash_attn_func
-    return flash_attn_func(q, k, v, dropout_p, softmax_scale, causal)
-
-@torch.library.register_fake('opensora::flashattention')
-def _flash_attention_fake(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, softmax_scale: float, causal: bool) -> torch.Tensor:
-    B, N, H, D = q.shape
-    O = torch.zeros((B, N, H, D), device=q.device, dtype=q.dtype)
-    return O
-
-def _flash_attention_backward(ctx, grad_output) -> tuple:
-    q, k, v = ctx.saved_tensors
-    grad_q = torch.zeros_like(q)
-    grad_k = torch.zeros_like(k)
-    grad_v = torch.zeros_like(v)
-    return grad_q, grad_k, grad_v, None, None, None
-
-def _flash_attention_backward_setup_context(ctx, inputs, output):
-    q, k, v, dropout_p, softmax_scale, causal = inputs
-    ctx.save_for_backward(q, k, v)
-
-_flash_attention_wrapper.register_autograd(_flash_attention_backward, setup_context=_flash_attention_backward_setup_context)
-
-xformers_attn_cache = {}
 
 # global_mask = torch.tensor([11, 11], dtype=torch.int32, device='cuda')
 
-@torch.library.custom_op('opensora::xformers_mha', mutates_args=())
-def _xformers_mha_wrapper(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, dropout_p: float, mask: bool, N: int, B: int) -> torch.Tensor:
-    attn_bias = None
-    if mask:
-        # mask = mask.tolist()
-        q_seqlen = [N] * B
-        kv_seqlen = [11, 11]
-        hash_key = tuple(q_seqlen)
-        if hash_key in xformers_attn_cache:
-            # print('USING CACHED ATTN BIAS')
-            attn_bias = xformers_attn_cache[hash_key]
-        else:
-            # print('CREATING NEW ATTN BIAS')
-            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(q_seqlen, kv_seqlen)
-            xformers_attn_cache[hash_key] = attn_bias
-    # print('q shape', q.shape)
-    # print('k shape', k.shape)
-    # print('v shape', v.shape)
-    return xformers.ops.memory_efficient_attention(q, k, v, p=dropout_p, attn_bias=attn_bias)
-
-@torch.library.register_fake('opensora::xformers_mha')
-def _xformers_mha_fake(q, k, v, dropout_p, mask, N, B):
-    B, N, H, D = q.shape
-    O = torch.zeros((B, N, H, D), device=q.device, dtype=q.dtype)
-    return O
-
-def _xformers_mha_backward(ctx, grad_output) -> tuple:
-    q, k, v = ctx.saved_tensors
-    grad_q = torch.zeros_like(q)
-    grad_k = torch.zeros_like(k)
-    grad_v = torch.zeros_like(v)
-    return grad_q, grad_k, grad_v, None, None, None, None
-
-def _xformers_mha_backward_setup_context(ctx, inputs, output):
-    q, k, v, dropout_p, mask, N, B = inputs
-    ctx.save_for_backward(q, k, v)
-
-_xformers_mha_wrapper.register_autograd(_xformers_mha_backward, setup_context=_xformers_mha_backward_setup_context)
+def f_sdpa(query, k, v):
+    is_bs_one = query.shape[0] == 1
+    attn_out = F.scaled_dot_product_attention(
+        query.reshape(2, -1, query.shape[2], query.shape[3]).permute(0, 2, 1, 3), 
+        k.reshape(2, -1, k.shape[2], k.shape[3]).permute(0, 2, 1, 3),
+        v.reshape(2, -1, v.shape[2], v.shape[3]).permute(0, 2, 1, 3)
+    )
+    attn_out = attn_out.permute(0, 2, 1, 3)
+    if is_bs_one:
+        attn_out = attn_out.reshape(1, -1, attn_out.shape[2], attn_out.shape[3])
+    return attn_out
 
 class Attention(nn.Module):
     def __init__(
@@ -245,28 +196,25 @@ class Attention(nn.Module):
         qkv_shape = (B, N, 3, self.num_heads, self.head_dim)
 
         qkv = qkv.view(qkv_shape).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
+        query, k, v = qkv.unbind(0)
         if self.qk_norm_legacy:
             # WARNING: this may be a bug
             if self.rope:
-                q = self.rotary_emb(q)
+                query = self.rotary_emb(query)
                 k = self.rotary_emb(k)
-            q, k = self.q_norm(q), self.k_norm(k)
+            query, k = self.q_norm(query), self.k_norm(k)
         else:
-            q, k = self.q_norm(q), self.k_norm(k)
+            query, k = self.q_norm(query), self.k_norm(k)
             if self.rope:
-                q = self.rotary_emb(q)
+                query = self.rotary_emb(query)
                 k = self.rotary_emb(k)
 
         if enable_flash_attn:
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            x = _flash_attention_wrapper(q, k, v, self.attn_drop.p if self.training else 0.0, self.scale, self.is_causal)
+            x = f_sdpa(query, k, v)
         else:
-            dtype = q.dtype
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)  # translate attn to float32
+            dtype = query.dtype
+            query = query * self.scale
+            attn = query @ k.transpose(-2, -1)  # translate attn to float32
             attn = attn.to(torch.float32)
             if self.is_causal:
                 causal_mask = torch.tril(torch.ones_like(attn), diagonal=0)
@@ -362,24 +310,24 @@ class KVCompressAttention(nn.Module):
         enable_flash_attn = self.enable_flash_attn and (N > B)
 
         qkv = self.qkv(x).reshape(B, N, 3, C)
-        q, k, v = qkv.unbind(2)
-        dtype = q.dtype
+        query, k, v = qkv.unbind(2)
+        dtype = query.dtype
         # KV compression
         if self.sr_ratio > 1:
             k, new_N = self.downsample_2d(k, H, W, self.sr_ratio, sampling=self.sampling)
             v, new_N = self.downsample_2d(v, H, W, self.sr_ratio, sampling=self.sampling)
 
-        q = q.reshape(B, N, self.num_heads, C // self.num_heads).to(dtype)
+        query = query.reshape(B, N, self.num_heads, C // self.num_heads).to(dtype)
         k = k.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
         v = v.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
 
-        q, k = self.q_norm(q), self.k_norm(k)
+        query, k = self.q_norm(query), self.k_norm(k)
 
         if enable_flash_attn:
             from flash_attn import flash_attn_func
 
             x = flash_attn_func(
-                q,
+                query,
                 k,
                 v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
@@ -389,17 +337,17 @@ class KVCompressAttention(nn.Module):
         elif self.mem_eff_attention:
             attn_bias = None
             if mask is not None:
-                attn_bias = torch.zeros([B * self.num_heads, q.shape[1], k.shape[1]], dtype=q.dtype, device=q.device)
+                attn_bias = torch.zeros([B * self.num_heads, query.shape[1], k.shape[1]], dtype=query.dtype, device=query.device)
                 attn_bias.masked_fill_(mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float("-inf"))
-            x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+            x = xformers.ops.memory_efficient_attention(query, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
         else:
             # (B, N, #heads, #dim) -> (B, #heads, N, #dim)
-            q = q.permute(0, 2, 1, 3)
+            query = query.permute(0, 2, 1, 3)
             k = k.permute(0, 2, 1, 3)
             v = v.permute(0, 2, 1, 3)
-            dtype = q.dtype
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)  # translate attn to float32
+            dtype = query.dtype
+            query = query * self.scale
+            attn = query @ k.transpose(-2, -1)  # translate attn to float32
             if not self.attn_half:
                 attn = attn.to(torch.float32)
             attn = attn.softmax(dim=-1)
@@ -472,22 +420,22 @@ class SeqParallelAttention(Attention):
         qkv = qkv.permute(qkv_permute_shape)
 
         # ERROR: Should qk_norm first
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
+        query, k, v = qkv.unbind(0)
+        query, k = self.q_norm(query), self.k_norm(k)
         if self.enable_flash_attn:
             from flash_attn import flash_attn_func
 
             x = flash_attn_func(
-                q,
+                query,
                 k,
                 v,
                 dropout_p=self.attn_drop.p if self.training else 0.0,
                 softmax_scale=self.scale,
             )
         else:
-            dtype = q.dtype
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)  # translate attn to float32
+            dtype = query.dtype
+            query = query * self.scale
+            attn = query @ k.transpose(-2, -1)  # translate attn to float32
             attn = attn.to(torch.float32)
             attn = attn.softmax(dim=-1)
             attn = attn.to(dtype)  # cast back attn to original dtype
@@ -528,14 +476,15 @@ class MultiHeadCrossAttention(nn.Module):
         # query/value: img tokens; key: condition; mask: if padding tokens
         B, N, C = x.shape
 
-        q = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
+        query = self.q_linear(x).view(1, -1, self.num_heads, self.head_dim)
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
 
-        # xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        # xformers.ops.memory_efficient_attention(query, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
         # if mask is not None:
         #     mask = torch.tensor(mask, dtype=torch.int, device='cpu')
-        x = _xformers_mha_wrapper(q, k, v, self.attn_drop.p, mask is not None, N, B)
+        # x = _xformers_mha_wrapper(query, k, v, 0, True, N, B)
+        x = f_sdpa(query, k, v)
 
         x = x.view(B, -1, C)
         x = self.proj(x)
@@ -566,16 +515,16 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         N = SUB_N * sp_size
 
         # shape:
-        # q, k, v: [B, SUB_N, NUM_HEADS, HEAD_DIM]
-        q = self.q_linear(x).view(B, -1, self.num_heads, self.head_dim)
+        # query, k, v: [B, SUB_N, NUM_HEADS, HEAD_DIM]
+        query = self.q_linear(x).view(B, -1, self.num_heads, self.head_dim)
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         kv = split_forward_gather_backward(kv, get_sequence_parallel_group(), dim=3, grad_scale="down")
         k, v = kv.unbind(2)
 
         # apply all_to_all to gather sequence and split attention heads
-        q = all_to_all(q, sp_group, scatter_dim=2, gather_dim=1)
+        query = all_to_all(query, sp_group, scatter_dim=2, gather_dim=1)
 
-        q = q.view(1, -1, self.num_heads // sp_size, self.head_dim)
+        query = query.view(1, -1, self.num_heads // sp_size, self.head_dim)
         k = k.view(1, -1, self.num_heads // sp_size, self.head_dim)
         v = v.view(1, -1, self.num_heads // sp_size, self.head_dim)
 
@@ -583,7 +532,7 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         attn_bias = None
         if mask is not None:
             attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        x = xformers.ops.memory_efficient_attention(query, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
 
         # apply all to all to gather back attention heads and scatter sequence
         x = x.view(B, -1, self.num_heads // sp_size, self.head_dim)
