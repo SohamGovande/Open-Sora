@@ -30,7 +30,7 @@ from opensora.acceleration.parallel_states import get_sequence_parallel_group
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
 torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_math_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)
 torch.backends.cuda.enable_cudnn_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 
@@ -423,15 +423,7 @@ class SeqParallelAttention(Attention):
         query, k, v = qkv.unbind(0)
         query, k = self.q_norm(query), self.k_norm(k)
         if self.enable_flash_attn:
-            from flash_attn import flash_attn_func
-
-            x = flash_attn_func(
-                query,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                softmax_scale=self.scale,
-            )
+            x = f_sdpa(query, k, v)
         else:
             dtype = query.dtype
             query = query * self.scale
@@ -480,10 +472,6 @@ class MultiHeadCrossAttention(nn.Module):
         kv = self.kv_linear(cond).view(1, -1, 2, self.num_heads, self.head_dim)
         k, v = kv.unbind(2)
 
-        # xformers.ops.memory_efficient_attention(query, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
-        # if mask is not None:
-        #     mask = torch.tensor(mask, dtype=torch.int, device='cpu')
-        # x = _xformers_mha_wrapper(query, k, v, 0, True, N, B)
         x = f_sdpa(query, k, v)
 
         x = x.view(B, -1, C)
@@ -529,10 +517,7 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         v = v.view(1, -1, self.num_heads // sp_size, self.head_dim)
 
         # compute attention
-        attn_bias = None
-        if mask is not None:
-            attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(query, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+        x = f_sdpa(query, k, v)
 
         # apply all to all to gather back attention heads and scatter sequence
         x = x.view(B, -1, self.num_heads // sp_size, self.head_dim)

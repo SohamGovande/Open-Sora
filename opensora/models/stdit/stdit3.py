@@ -359,15 +359,6 @@ class STDiT3(PreTrainedModel):
             y = y.squeeze(1).view(1, -1, self.hidden_size)
         return y, y_lens
 
-    @torch.compile(fullgraph=True, options={'triton.cudagraphs': True, 'triton.cudagraph_support_input_mutation': True}, disable=not SHOULD_COMPILE)
-    def compiled_blocks(self, x_in, y, t_mlp, y_lens, x_mask, t0_mlp, T, S):
-        x = x_in
-        # === blocks ===
-        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
-            x = spatial_block(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-            x = temporal_block(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-        return x
-
     @torch.compile(disable=not SHOULD_COMPILE)
     def compiled_step_1(self, x, pos_emb, T, S):
         # === get x embed ===
@@ -398,7 +389,16 @@ class STDiT3(PreTrainedModel):
         x = x.to(torch.float32)
         return x
 
+    @torch.compile(disable=not SHOULD_COMPILE)
+    def compiled_blocks(self, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S):
+        # === blocks ===
+        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
+            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        return x
+
     def forward(self, x, timestep, y, mask=None, x_mask=None, fps=None, height=None, width=None, **kwargs):
+        # print(f"STDiT3 forward {dist.get_rank()}")
         dtype = self.x_embedder.proj.weight.dtype
         B = x.size(0)
         x = x.to(dtype)
@@ -452,9 +452,34 @@ class STDiT3(PreTrainedModel):
         else:
             y, y_lens = self.encode_text(y, mask)
             
-        x = self.compiled_step_1(x, pos_emb, T, S)
+        # === get x embed ===
+        x = self.x_embedder(x)  # [B, N, C]
+        x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+        x = x + pos_emb
+
+        # shard over the sequence dim if sp is enabled
+        if self.enable_sequence_parallelism:
+            x = split_forward_gather_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="down")
+            S = S // dist.get_world_size(get_sequence_parallel_group())
+
+        x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
         x = self.compiled_blocks(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-        x = self.compiled_step_2(x, T, S, t, x_mask, t0, H, W, Tx, Hx, Wx)
+
+        if self.enable_sequence_parallelism:
+            x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
+            x = gather_forward_split_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="up")
+            S = S * dist.get_world_size(get_sequence_parallel_group())
+            x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
+
+        # === final layer ===
+        x = self.final_layer(x, t, x_mask, t0, T, S)
+        x = self.unpatchify(x, T, H, W, Tx, Hx, Wx)
+
+        # cast to float32 for better accuracy
+        x = x.to(torch.float32)
+        # x = self.compiled_step_1(x, pos_emb, T, S)
+        # x = self.compiled_blocks(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        # x = self.compiled_step_2(x, T, S, t, x_mask, t0, H, W, Tx, Hx, Wx)
         return x
 
     def unpatchify(self, x, N_t, N_h, N_w, R_t, R_h, R_w):

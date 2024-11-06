@@ -34,7 +34,10 @@ from opensora.utils.inference_utils import (
     split_prompt,
 )
 from opensora.utils.misc import all_exists, create_logger, is_distributed, is_main_process, to_torch_dtype
+from torch._logging import set_logs
+import logging
 
+set_logs(dynamo=logging.INFO, inductor=logging.INFO)
 
 def main():
     torch.set_grad_enabled(False)
