@@ -29,6 +29,18 @@ from opensora.acceleration.parallel_states import get_sequence_parallel_group
 approx_gelu = lambda: nn.GELU(approximate="tanh")
 
 
+def f_sdpa(query, k, v):
+    is_bs_one = query.shape[0] == 1
+    attn_out = F.scaled_dot_product_attention(
+        query.reshape(2, -1, query.shape[2], query.shape[3]).permute(0, 2, 1, 3), 
+        k.reshape(2, -1, k.shape[2], k.shape[3]).permute(0, 2, 1, 3),
+        v.reshape(2, -1, v.shape[2], v.shape[3]).permute(0, 2, 1, 3)
+    )
+    attn_out = attn_out.permute(0, 2, 1, 3)
+    if is_bs_one:
+        attn_out = attn_out.reshape(1, -1, attn_out.shape[2], attn_out.shape[3])
+    return attn_out
+
 class LlamaRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         """
@@ -47,7 +59,7 @@ class LlamaRMSNorm(nn.Module):
 
 
 def get_layernorm(hidden_size: torch.Tensor, eps: float, affine: bool, use_kernel: bool):
-    if use_kernel:
+    if False:
         try:
             from apex.normalization import FusedLayerNorm
 
@@ -187,34 +199,7 @@ class Attention(nn.Module):
                 q = self.rotary_emb(q)
                 k = self.rotary_emb(k)
 
-        if enable_flash_attn:
-            from flash_attn import flash_attn_func
-
-            # (B, #heads, N, #dim) -> (B, N, #heads, #dim)
-            q = q.permute(0, 2, 1, 3)
-            k = k.permute(0, 2, 1, 3)
-            v = v.permute(0, 2, 1, 3)
-            x = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=self.is_causal,
-            )
-        else:
-            dtype = q.dtype
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)  # translate attn to float32
-            attn = attn.to(torch.float32)
-            if self.is_causal:
-                causal_mask = torch.tril(torch.ones_like(attn), diagonal=0)
-                causal_mask = torch.where(causal_mask.bool(), 0, float('-inf'))
-                attn += causal_mask
-            attn = attn.softmax(dim=-1)
-            attn = attn.to(dtype)  # cast back attn to original dtype
-            attn = self.attn_drop(attn)
-            x = attn @ v
+        x = f_sdpa(q, k, v)
 
         x_output_shape = (B, N, C)
         if not enable_flash_attn:
@@ -414,15 +399,7 @@ class SeqParallelAttention(Attention):
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
         if self.enable_flash_attn:
-            from flash_attn import flash_attn_func
-
-            x = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                softmax_scale=self.scale,
-            )
+            x = f_sdpa(q, k, v)
         else:
             dtype = q.dtype
             q = q * self.scale
@@ -473,7 +450,7 @@ class MultiHeadCrossAttention(nn.Module):
 
         attn_bias = None
         if mask is not None:
-            attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
+            attn_bias = xformers.ops.fmha.attn_bias.BlockDiagonalMask.from_seqlens([N] * B, mask)
         x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
 
         x = x.view(B, -1, C)
@@ -519,11 +496,8 @@ class SeqParallelMultiHeadCrossAttention(MultiHeadCrossAttention):
         v = v.view(1, -1, self.num_heads // sp_size, self.head_dim)
 
         # compute attention
-        attn_bias = None
-        if mask is not None:
-            attn_bias = xformers.ops.fmha.BlockDiagonalMask.from_seqlens([N] * B, mask)
-        x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
-
+        x = f_sdpa(q, k, v)
+        
         # apply all to all to gather back attention heads and scatter sequence
         x = x.view(B, -1, self.num_heads // sp_size, self.head_dim)
         x = all_to_all(x, sp_group, scatter_dim=1, gather_dim=2)
