@@ -352,6 +352,14 @@ class STDiT3(PreTrainedModel):
             y = y.squeeze(1).view(1, -1, self.hidden_size)
         return y, y_lens
 
+    @torch.compile(mode='reduce-overhead')
+    def compiled_blocks(self, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S):
+        # === blocks ===
+        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
+            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        return x
+
     def forward(self, x, timestep, y, mask=None, x_mask=None, fps=None, height=None, width=None, **kwargs):
         dtype = self.x_embedder.proj.weight.dtype
         B = x.size(0)
@@ -418,11 +426,8 @@ class STDiT3(PreTrainedModel):
 
         x = rearrange(x, "B T S C -> B (T S) C", T=T, S=S)
 
-        # === blocks ===
-        for spatial_block, temporal_block in zip(self.spatial_blocks, self.temporal_blocks):
-            x = auto_grad_checkpoint(spatial_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-            x = auto_grad_checkpoint(temporal_block, x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
-
+        x = self.compiled_blocks(x, y, t_mlp, y_lens, x_mask, t0_mlp, T, S)
+        
         if self.enable_sequence_parallelism:
             x = rearrange(x, "B (T S) C -> B T S C", T=T, S=S)
             x = gather_forward_split_backward(x, get_sequence_parallel_group(), dim=2, grad_scale="up")
